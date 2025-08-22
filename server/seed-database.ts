@@ -3,7 +3,7 @@ import {
   GoogleGenerativeAIEmbeddings,
 } from "@langchain/google-genai";
 import { StructuredOutputParser } from "@langchain/core/output_parsers";
-import { Db, MongoClient } from "mongodb";
+import { MongoClient } from "mongodb";
 import { MongoDBAtlasVectorSearch } from "@langchain/mongodb";
 import { record, z } from "zod";
 import "dotenv/config";
@@ -53,9 +53,8 @@ async function setupDatabaseAndCollection(): Promise<void> {
   const collection = await db.listCollections({ name: "items" }).toArray();
 
   if (collection.length === 0) {
-    const collectionCreated = await db.createCollection("items");
-    console.log("collection created inventory_database");
-    console.log("collectionCreated:", collectionCreated);
+    await db.createCollection("items");
+    console.log("Created 'items' collection in 'inventory_database' database");
   } else {
     console.log("collection already exist in inventory_database");
   }
@@ -63,10 +62,8 @@ async function setupDatabaseAndCollection(): Promise<void> {
 
 async function createVectorSearchIndex(): Promise<void> {
   try {
-    // define db.
     const db = client.db("inventory_database");
-    // define collection.
-    const collection = db.collection("item");
+    const collection = db.collection("items");
     await collection.dropIndexes();
     const vectorSearchIdx = {
       name: "vector_index",
@@ -75,24 +72,19 @@ async function createVectorSearchIndex(): Promise<void> {
         fields: [
           {
             type: "vector",
-            path: "emdbedding",
+            path: "embedding",
             numDimensions: 768,
             similarity: "cosine",
           },
         ],
       },
     };
+    console.log("Creating vector search index...");
+    await collection.createSearchIndex(vectorSearchIdx);
 
-    console.log("crateing vector search index...");
-    const vectorSearchCreated = await collection.createSearchIndex(
-      vectorSearchIdx
-    );
-    console.log(
-      "Successfully created vector search index",
-      vectorSearchCreated
-    );
-  } catch (error) {
-    console.error("Failed to create vector search:", error);
+    console.log("Successfully created vector search index");
+  } catch (e) {
+    console.error("Failed to create vector search index:", e);
   }
 }
 
