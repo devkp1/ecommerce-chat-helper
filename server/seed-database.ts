@@ -1,0 +1,180 @@
+import {
+  ChatGoogleGenerativeAI,
+  GoogleGenerativeAIEmbeddings,
+} from "@langchain/google-genai";
+import { StructuredOutputParser } from "@langchain/core/output_parsers";
+import { Db, MongoClient } from "mongodb";
+import { MongoDBAtlasVectorSearch } from "@langchain/mongodb";
+import { record, z } from "zod";
+import "dotenv/config";
+
+// create mongodb instance
+const client = new MongoClient(process.env.MONGODB_ATLAS_URI as string);
+
+const llm = new ChatGoogleGenerativeAI({
+  model: "gemini-1.5-flash",
+  temperature: 0.7,
+  apiKey: process.env.GOOGLE_API_KEY,
+});
+
+const itemSchema = z.object({
+  item_id: z.string(),
+  item_name: z.string(),
+  item_description: z.string(),
+  brand: z.string(),
+  manufacture_address: z.object({
+    street: z.string(),
+    city: z.string(),
+    postal_code: z.string(),
+    country: z.string(),
+  }),
+  prices: z.object({
+    full_price: z.number(),
+    sale_price: z.number(),
+  }),
+  categories: z.array(z.string()),
+  user_reviews: z.array(
+    z.object({
+      review_date: z.string(),
+      rating: z.number(),
+      comment: z.string(),
+    })
+  ),
+  notes: z.string(),
+});
+
+type Item = z.infer<typeof itemSchema>;
+
+const parser = StructuredOutputParser.fromZodSchema(z.array(itemSchema));
+
+async function setupDatabaseAndCollection(): Promise<void> {
+  console.log("setting up database and collection...");
+  const db = client.db("inventory_database");
+  const collection = await db.listCollections({ name: "items" }).toArray();
+
+  if (collection.length === 0) {
+    const collectionCreated = await db.createCollection("items");
+    console.log("collection created inventory_database");
+    console.log("collectionCreated:", collectionCreated);
+  } else {
+    console.log("collection already exist in inventory_database");
+  }
+}
+
+async function createVectorSearchIndex(): Promise<void> {
+  try {
+    // define db.
+    const db = client.db("inventory_database");
+    // define collection.
+    const collection = db.collection("item");
+    await collection.dropIndexes();
+    const vectorSearchIdx = {
+      name: "vector_index",
+      type: "vectorSearch",
+      definition: {
+        fields: [
+          {
+            type: "vector",
+            path: "emdbedding",
+            numDimensions: 768,
+            similarity: "cosine",
+          },
+        ],
+      },
+    };
+
+    console.log("crateing vector search index...");
+    const vectorSearchCreated = await collection.createSearchIndex(
+      vectorSearchIdx
+    );
+    console.log(
+      "Successfully created vector search index",
+      vectorSearchCreated
+    );
+  } catch (error) {
+    console.error("Failed to create vector search:", error);
+  }
+}
+
+async function generateSynteticData(): Promise<Item[]> {
+  const prompt = `You are helpful assistant that generates furniture store item data. generate 10 furniture store items. Each record should include the following fields : item_id, item_name, item_description, brand, manufacturer_address, prices, categories, user_reviews, notes. Ensure variety and the realistic in data.
+  ${parser.getFormatInstructions()}
+  `;
+
+  console.log("generating synthetic data...");
+
+  const response = await llm.invoke(prompt);
+
+  return parser.parse(response.content as string);
+}
+
+async function createItemSummary(item: Item): Promise<string> {
+  return new Promise((resolve) => {
+    const manufacturerDetails = `Made in ${item.manufacture_address.country}`;
+    const categories = item.categories.join(", ");
+    const userReviews = item.user_reviews
+      .map(
+        (review) =>
+          `Rated ${review.rating} on ${review.review_date}: ${review.comment}`
+      )
+      .join(" ");
+    const basicInfo = `${item.item_name} ${item.item_description} from the brand ${item.brand}`;
+    const price = `At full price it costs: ${item.prices.full_price} USD, on sale it costs: ${item.prices.sale_price}USD`;
+    const notes = item.notes;
+
+    const summary = `${basicInfo}. Manufacturer: ${manufacturerDetails}. Categories: ${categories}. Reviews: ${userReviews}. Price: ${price}. Notes: ${notes}`;
+
+    resolve(summary);
+  });
+}
+
+async function seedDatabase(): Promise<void> {
+  try {
+    await client.connect();
+    await client.db("admin").command({ ping: 1 });
+
+    await setupDatabaseAndCollection();
+    await createVectorSearchIndex();
+
+    const db = client.db("inventory_database");
+    const collection = db.collection("items");
+
+    await collection.deleteMany({});
+    console.log("cleared existing data from collection.");
+
+    const syntheticData = await generateSynteticData();
+
+    const recordsWithSummaries = await Promise.all(
+      syntheticData.map(async (record) => ({
+        pageContent: await createItemSummary(record),
+        metadata: { ...record },
+      }))
+    );
+
+    for (const record of recordsWithSummaries) {
+      await MongoDBAtlasVectorSearch.fromDocuments(
+        [record],
+        new GoogleGenerativeAIEmbeddings({
+          apiKey: process.env.GOOGLE_API_KEY,
+          modelName: "text-embedding-004",
+        }),
+        {
+          collection,
+          indexName: "vector_index",
+          embeddingKey: "embedding",
+        }
+      );
+      console.log(
+        "successfully processed and saved the records :",
+        record.metadata.item_id
+      );
+    }
+    console.log("database seeding completed.");
+  } catch (error) {
+    console.error("", error);
+  } finally {
+    await client.close();
+  }
+}
+
+seedDatabase().catch(console.error);
