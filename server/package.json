@@ -5,7 +5,7 @@
   "main": "index.ts",
   "scripts": {
     "dev": "npx ts-node index.ts",
-    "seed": "npx "
+    "seed": "npx ts-node seed-database.ts"
   },
   "keywords": [],
   "author": "",
